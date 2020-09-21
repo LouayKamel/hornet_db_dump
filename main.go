@@ -1,12 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 
 	"github.com/gohornet/hornet/pkg/config"
 	"github.com/gohornet/hornet/pkg/model/hornet"
@@ -37,6 +37,11 @@ type Dump struct {
 	Trytes            trinary.Trytes
 }
 
+func init() {
+	runtime.LockOSThread()
+	runtime.GOMAXPROCS(1)
+}
+
 func main() {
 	config.NodeConfig.Set(profile.CfgUseProfile, "auto")
 
@@ -58,27 +63,27 @@ func main() {
 
 	totalCount, successCount := 0, 0
 	tangle.ConfigureDatabases(dbPath)
-	log.Println(tangle.GetTransactionStorageSize())
-	tangle.ForEachTransactionMetadataHash(func(txHash hornet.Hash) bool {
+	tangle.ForEachTransactionHash(func(txHash hornet.Hash) bool {
 		totalCount++
 		cachedTx := tangle.GetCachedTransactionOrNil(txHash)
 		if cachedTx == nil {
 			log.Println(fmt.Errorf("tx %s not found: %w", txHash.Trytes(), ErrTxNotFound).Error())
 			return true
 		}
-		defer cachedTx.Release()
+		defer cachedTx.Release(true)
+
 		trytes, err := transaction.TransactionToTrytes(cachedTx.GetTransaction().Tx)
 		if err != nil {
 			log.Println(fmt.Errorf("cannot convert transaction to trytes: %w", err).Error())
 			return true
 		}
-		cachedTxMetadata := tangle.GetCachedTxMetadataOrNil(txHash)
-		if cachedTxMetadata == nil {
+
+		txMetadata := cachedTx.GetMetadata()
+		if txMetadata == nil {
 			log.Println(fmt.Errorf("tx metadata %s not found: %w", txHash.Trytes(), ErrTxMetadataNotFound).Error())
 			return true
 		}
-		defer cachedTxMetadata.Release()
-		txMetadata := cachedTxMetadata.GetMetadata()
+
 		isConfirmed, confirmationIndex := txMetadata.GetConfirmed()
 		dump := Dump{
 			TxHash:            txMetadata.GetTxHash().Trytes(),
@@ -97,6 +102,7 @@ func main() {
 
 		if writeToFile(f, dump) {
 			successCount++
+			log.Println(dump.TxHash, " done...")
 		}
 		return true
 	}, true)
@@ -105,17 +111,16 @@ func main() {
 }
 
 func writeToFile(f *os.File, dump Dump) bool {
-	bytes, err := json.MarshalIndent(dump, "", "    ")
-	if err != nil {
-		log.Println(fmt.Errorf("err marshalling dump: %w", err).Error())
-		return false
+	var is_conflicting int8
+	if dump.IsConflicting {
+		 is_conflicting = 1
+	} else {
+		 is_conflicting = 0
 	}
-	jsonStr := string(bytes)
-
-	if _, err := f.WriteString(fmt.Sprintf("%s\n", jsonStr)); err != nil {
+	line := fmt.Sprintf("%v,%v,%b,%d\n",dump.TxHash,dump.Trytes,is_conflicting,dump.confirmationIndex)
+	if _, err := f.WriteString(line); err != nil {
 		log.Println(fmt.Errorf("err writing to file: %w", err).Error())
 		return false
 	}
-	log.Println(dump.TxHash, " done...")
 	return true
 }
