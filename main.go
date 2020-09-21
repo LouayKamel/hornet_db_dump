@@ -65,26 +65,30 @@ func main() {
 	tangle.ConfigureDatabases(dbPath)
 	tangle.ForEachTransactionHash(func(txHash hornet.Hash) bool {
 		totalCount++
+		log.Println(totalCount, " Iter on a new transaction; totalCount...")
 		cachedTx := tangle.GetCachedTransactionOrNil(txHash)
 		if cachedTx == nil {
 			log.Println(fmt.Errorf("tx %s not found: %w", txHash.Trytes(), ErrTxNotFound).Error())
 			return true
 		}
+		log.Println("Got cachedTx...")
 		defer cachedTx.Release(true)
-
 		trytes, err := transaction.TransactionToTrytes(cachedTx.GetTransaction().Tx)
+		log.Println("GotTrytes...")
 		if err != nil {
 			log.Println(fmt.Errorf("cannot convert transaction to trytes: %w", err).Error())
 			return true
 		}
-
 		txMetadata := cachedTx.GetMetadata()
 		if txMetadata == nil {
 			log.Println(fmt.Errorf("tx metadata %s not found: %w", txHash.Trytes(), ErrTxMetadataNotFound).Error())
 			return true
 		}
+		log.Println("Got Metadata...")
 
 		isConfirmed, confirmationIndex := txMetadata.GetConfirmed()
+		log.Println("Got ConfirmedStatus...")
+
 		dump := Dump{
 			TxHash:            txMetadata.GetTxHash().Trytes(),
 			TrunkHash:         txMetadata.GetTrunkHash().Trytes(),
