@@ -1,25 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 
-	"github.com/gohornet/hornet/pkg/config"
+	"github.com/boltdb/bolt"
 	"github.com/gohornet/hornet/pkg/model/hornet"
 	"github.com/gohornet/hornet/pkg/model/milestone"
-	"github.com/gohornet/hornet/pkg/model/tangle"
-	"github.com/gohornet/hornet/pkg/profile"
 	"github.com/iotaledger/iota.go/transaction"
 	"github.com/iotaledger/iota.go/trinary"
-)
-
-var (
-	ErrTxMetadataNotFound = errors.New("tx metadata not found")
-	ErrTxNotFound         = errors.New("tx not found")
 )
 
 type Dump struct {
@@ -30,21 +23,22 @@ type Dump struct {
 	confirmationIndex milestone.Index
 	IsSolid           bool
 	IsConfirmed       bool
-	IsConflicting     bool
+	IsConflicting     uint8
 	IsHead            bool
 	IsTail            bool
 	IsValue           bool
 	Trytes            trinary.Trytes
 }
 
-func init() {
-	runtime.LockOSThread()
-	runtime.GOMAXPROCS(1)
-}
+var (
+	db                       *bolt.DB
+	err                      error
+	transactionStorageBucket = []byte{1}
+	metadataStorageBucket    = []byte{2}
+	totalCount, successCount = 0, 0
+)
 
 func main() {
-	config.NodeConfig.Set(profile.CfgUseProfile, "auto")
-
 	cfgDbPath := flag.String("dbPath", "", "directory that contains the tangle.db")
 	cfgOutputFile := flag.String("output", "output.txt", "output file to store the dump")
 	flag.Parse()
@@ -54,6 +48,10 @@ func main() {
 	if dbPath == "" {
 		log.Fatal("dbPath is required")
 	}
+	db, err = bolt.Open(dbPath+"/tangle.db", 0600, &bolt.Options{ReadOnly: true})
+	if err != nil {
+		log.Panic(err)
+	}
 
 	f, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -61,70 +59,126 @@ func main() {
 	}
 	defer f.Close()
 
-	totalCount, successCount := 0, 0
-	tangle.ConfigureDatabases(dbPath)
-	tangle.ForEachTransactionHash(func(txHash hornet.Hash) bool {
-		totalCount++
-		log.Println(totalCount, " Iter on a new transaction; totalCount...")
-		cachedTx := tangle.GetCachedTransactionOrNil(txHash)
-		if cachedTx == nil {
-			log.Println(fmt.Errorf("tx %s not found: %w", txHash.Trytes(), ErrTxNotFound).Error())
-			return true
-		}
-		log.Println("Got cachedTx...")
-		defer cachedTx.Release(true)
-		trytes, err := transaction.TransactionToTrytes(cachedTx.GetTransaction().Tx)
-		log.Println("GotTrytes...")
-		if err != nil {
-			log.Println(fmt.Errorf("cannot convert transaction to trytes: %w", err).Error())
-			return true
-		}
-		txMetadata := cachedTx.GetMetadata()
-		if txMetadata == nil {
-			log.Println(fmt.Errorf("tx metadata %s not found: %w", txHash.Trytes(), ErrTxMetadataNotFound).Error())
-			return true
-		}
-		log.Println("Got Metadata...")
+	baremetal(f)
+}
 
-		isConfirmed, confirmationIndex := txMetadata.GetConfirmed()
-		log.Println("Got ConfirmedStatus...")
+func baremetal(f *os.File) {
+	_ = forEachInBucket(transactionStorageBucket, func(k, v []byte) error {
+		totalCount++
+		tx := hornet.NewTransaction(k)
+		_, err = tx.UnmarshalObjectStorageValue(v)
+		if err != nil {
+			log.Printf("error unmarshaling tx: %s", err.Error())
+			return nil
+		}
+
+		bytes, err := findInBucket(metadataStorageBucket, k)
+		if err != nil {
+			log.Println("error finding metadata: ", err.Error())
+			return nil
+		}
+		if len(bytes) == 0 {
+			log.Printf("metada for %s not found\n", tx.GetTxHash().Trytes())
+			return nil
+		}
+		metadataBytes := bytes[0]
+		txMetadata := hornet.NewTransactionMetadata(k)
+		_, err = txMetadata.UnmarshalObjectStorageValue(metadataBytes)
+		if err != nil {
+			log.Printf("error unmarshaling metadta: %s", err.Error())
+			return nil
+		}
+
+		trytes, _ := transaction.TransactionToTrytes(tx.Tx)
+		_, confirmationIndex := txMetadata.GetConfirmed()
+		var isConflicting uint8
+		if txMetadata.IsConflicting() {
+			isConflicting = 1
+		} else {
+			isConflicting = 0
+		}
 
 		dump := Dump{
-			TxHash:            txMetadata.GetTxHash().Trytes(),
-			TrunkHash:         txMetadata.GetTrunkHash().Trytes(),
-			BranchHash:        txMetadata.GetBranchHash().Trytes(),
-			BundleHash:        txMetadata.GetBranchHash().Trytes(),
+			TxHash:            tx.GetTxHash().Trytes(),
 			confirmationIndex: confirmationIndex,
-			IsSolid:           txMetadata.IsSolid(),
-			IsConfirmed:       isConfirmed,
-			IsConflicting:     txMetadata.IsConflicting(),
-			IsHead:            txMetadata.IsHead(),
-			IsTail:            txMetadata.IsTail(),
-			IsValue:           txMetadata.IsValue(),
+			IsConflicting:     isConflicting,
 			Trytes:            trytes,
 		}
 
-		if writeToFile(f, dump) {
-			successCount++
-			log.Println(dump.TxHash, " done...")
+		line := fmt.Sprintf("%v,%v,%b,%d\n", dump.TxHash, dump.Trytes, isConflicting, confirmationIndex)
+
+		if _, err := f.WriteString(line); err != nil {
+			log.Println(fmt.Errorf("err writing to file: %w", err).Error())
+			return nil
 		}
-		return true
-	}, true)
+
+		log.Println(tx.GetTxHash().Trytes(), " ...done")
+		successCount++
+		return nil
+	})
+
 	log.Println("Total txs: ", totalCount)
 	log.Println("Success: ", successCount)
 }
 
-func writeToFile(f *os.File, dump Dump) bool {
-	var is_conflicting int8
-	if dump.IsConflicting {
-		 is_conflicting = 1
-	} else {
-		 is_conflicting = 0
-	}
-	line := fmt.Sprintf("%v,%v,%b,%d\n",dump.TxHash,dump.Trytes,is_conflicting,dump.confirmationIndex)
-	if _, err := f.WriteString(line); err != nil {
-		log.Println(fmt.Errorf("err writing to file: %w", err).Error())
-		return false
-	}
-	return true
+func forEachInBucket(bucketName []byte, fn func(_k, _v []byte) error) error {
+	return db.View(func(tx *bolt.Tx) error {
+		var bk *bolt.Bucket
+
+		//find the bucket
+		_ = tx.ForEach(func(nm []byte, b *bolt.Bucket) error {
+			if bytes.Equal(nm, bucketName) {
+				bk = b
+				// stop finding
+				return errors.New("")
+			}
+			return nil
+		})
+		if bk == nil {
+			return fmt.Errorf("bucket not found")
+		}
+
+		if bk.Tx().DB() == nil {
+			return fmt.Errorf("tx closed")
+		}
+		c := bk.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if err := fn(k, v); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
+// prefix is a key prefix. e.g if prefix = "123", then you are looking for pairs whos keys are prefixed with "123"
+func findInBucket(bucketName []byte, prefix []byte) (res [][]byte, err error) {
+	err = db.View(func(tx *bolt.Tx) error {
+		var bk *bolt.Bucket
+		//find the bucket
+		_ = tx.ForEach(func(nm []byte, b *bolt.Bucket) error {
+			if bytes.Equal(nm, bucketName) {
+				bk = b
+				// stop finding
+				return errors.New("")
+			}
+			return nil
+		})
+		if bk == nil {
+			return fmt.Errorf("bucket not found")
+		}
+
+		if bk.Tx().DB() == nil {
+			err = fmt.Errorf("tx closed")
+			return nil
+		}
+		c := bk.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			res = append(res, v)
+		}
+		return nil
+
+	})
+	return
 }
